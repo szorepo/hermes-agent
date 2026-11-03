@@ -327,7 +327,11 @@ def admission_display(payload):
 
 
 def _route_identity(source):
-    return {key: value for key, value in source.to_dict().items() if key != 'message_id'}
+    # Presentation labels and Discord creation metadata can change while
+    # the underlying platform, profile, scope, chat, thread and user stay put.
+    ignored = {'message_id', 'chat_name', 'chat_topic', 'user_name',
+               'auto_thread_created', 'auto_thread_initial_name'}
+    return {key: value for key, value in source.to_dict().items() if key not in ignored}
 
 
 def committed_route_envelope(authority, entry):
