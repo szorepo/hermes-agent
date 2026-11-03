@@ -157,7 +157,7 @@ async def test_native_automation_category_roundtrip(tmp_path, monkeypatch, categ
 _SOURCE = dict(chat_id='42', chat_type='dm', user_id='42', user_name='human')
 
 
-async def _native_owner(tmp_path, monkeypatch, human_message_id):
+async def _native_owner(tmp_path, monkeypatch, human_message_id, source_fields=None):
     from gateway.session_ingress_context import native_callback, register_transport_home
     from plugins.platforms.discord.adapter import DiscordAdapter
     runner, authority = await _authority(tmp_path, monkeypatch)
@@ -166,9 +166,10 @@ async def _native_owner(tmp_path, monkeypatch, human_message_id):
     runner._wire_adapter_handlers(adapter)
     register_transport_home(runner, None, tmp_path)
     monkeypatch.setenv('DISCORD_ALLOWED_USERS', '42')
-    source = adapter.build_source(**_SOURCE)
+    fields = _SOURCE if source_fields is None else source_fields
+    source = adapter.build_source(**fields)
     # The committed human turn keeps its platform reply anchor on the source.
-    human = MessageEvent(text='human', source=adapter.build_source(**_SOURCE, message_id=human_message_id),
+    human = MessageEvent(text='human', source=adapter.build_source(**fields, message_id=human_message_id),
                          message_id=human_message_id)
     with native_callback(runner, human, tmp_path):
         await authority.admit_native(human)
@@ -202,7 +203,24 @@ async def test_native_completion_wake_admits_when_source_differs_only_by_message
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('field', ['user_name', 'user_id', 'thread_id'])
+async def test_native_completion_wake_accepts_changed_display_name(tmp_path, monkeypatch):
+    from gateway.session_envelope import restore_native
+    from hermes_state_runtime import get_session_admission
+    _runner, authority, adapter, _source, metadata = await _native_owner(tmp_path, monkeypatch, 'human-1')
+    try:
+        renamed = adapter.build_source(**{**_SOURCE, 'user_name': 'renamed'})
+        event = MessageEvent(text='notice', source=renamed, internal=True, metadata=dict(metadata))
+        receipt = await authority.admit_automation(adapter, event, 'renamed-notice')
+        row = get_session_admission(authority.db, admission_id=receipt.admission_id)
+        assert row is not None
+        assert 'message_id' not in row['payload']['native_text_v1']['source']
+        assert restore_native(row['payload'], _runner).source.user_id == _SOURCE['user_id']
+    finally:
+        authority.db.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('field', ['user_id', 'thread_id'])
 async def test_native_completion_wake_refuses_other_source_drift(tmp_path, monkeypatch, field):
     _runner, authority, adapter, _source, metadata = await _native_owner(tmp_path, monkeypatch, 'human-1')
     try:
@@ -210,6 +228,42 @@ async def test_native_completion_wake_refuses_other_source_drift(tmp_path, monke
         event = MessageEvent(text='notice', source=drifted, internal=True, metadata=dict(metadata))
         with pytest.raises(RuntimeStoreError, match='admission_conflict'):
             await authority.admit_automation(adapter, event, 'notice')
+    finally:
+        authority.db.close()
+
+
+@pytest.mark.asyncio
+async def test_discord_prospective_wake_preserves_native_provenance_and_boundaries(tmp_path, monkeypatch):
+    from dataclasses import replace
+    from gateway.session_envelope import restore_native
+    from plugins.platforms.discord.adapter import DiscordAdapter
+
+    fields = dict(chat_id='channel', chat_type='thread', user_id='42', thread_id='thread', scope_id='guild')
+    runner, authority, adapter, source, metadata = await _native_owner(tmp_path, monkeypatch, 'human-1', fields)
+    try:
+        owner = authority.logical_owner(metadata['gateway_session_id'])
+        human_rows = list_session_admissions(authority.db, session_id=owner, pending_only=False)
+        human = next(row['payload']['native_text_v1'] for row in human_rows if 'native_text_v1' in row['payload'])
+        initiating = replace(source, chat_type='group', thread_id=None, prospective_thread_id='thread',
+                             chat_name='renamed', user_name='renamed', auto_thread_created=True,
+                             auto_thread_initial_name='initial')
+        event = MessageEvent(text='notice', source=initiating, internal=True, metadata=dict(metadata))
+        receipt = await authority.admit_automation(adapter, event, 'prospective-notice')
+        row = get_session_admission(authority.db, admission_id=receipt.admission_id)
+        envelope = row['payload']['native_text_v1']
+        assert envelope['provenance'] == human['provenance']
+        assert 'message_id' not in envelope['source']
+        assert runner._adapter_for_source(restore_native(row['payload'], runner).source) is adapter
+        for field, value in {'prospective_thread_id': 'other-thread', 'chat_id': 'other-channel',
+                             'user_id': 'other-user', 'scope_id': 'other-guild',
+                             'profile': 'other-profile', 'platform': Platform.TELEGRAM}.items():
+            bad = MessageEvent(text='notice', source=replace(initiating, **{field: value}),
+                               internal=True, metadata=dict(metadata))
+            with pytest.raises(RuntimeStoreError, match='admission_conflict'):
+                await authority.admit_automation(adapter, bad, 'bad-' + field)
+        stranger = DiscordAdapter(PlatformConfig(enabled=True, token='***', typing_indicator=False))
+        with pytest.raises(RuntimeStoreError, match='admission_conflict'):
+            await authority.admit_automation(stranger, event, 'bad-adapter')
     finally:
         authority.db.close()
 

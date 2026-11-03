@@ -331,7 +331,18 @@ def _route_identity(source):
     # the underlying platform, profile, scope, chat, thread and user stay put.
     ignored = {'message_id', 'chat_name', 'chat_topic', 'user_name',
                'auto_thread_created', 'auto_thread_initial_name'}
-    return {key: value for key, value in source.to_dict().items() if key not in ignored}
+    route = {key: value for key, value in source.to_dict().items() if key not in ignored}
+    # Discord's relay can key the initiating channel event to a prospective thread;
+    # its follow-up has the same channel and a real thread_id instead.
+    if source.platform == Platform.DISCORD:
+        prospective = route.get('prospective_thread_id')
+        thread = route.get('thread_id')
+        if route.get('chat_type') in ('group', 'channel') and prospective and not thread:
+            route['chat_type'], route['thread_id'] = 'thread', prospective
+            route.pop('prospective_thread_id')
+        elif route.get('chat_type') == 'thread' and thread and prospective == thread:
+            route.pop('prospective_thread_id')
+    return route
 
 
 def committed_route_envelope(authority, entry):
